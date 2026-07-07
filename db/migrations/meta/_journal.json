@@ -57,6 +57,13 @@
       "when": 1757422577613,
       "tag": "0007_smart_vargas",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1783430021848,
+      "tag": "0008_funny_giant_man",
+      "breakpoints": true
     }
   ]
 }

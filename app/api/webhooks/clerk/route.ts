@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from "next/server"
 import { Webhook } from "svix"
 import { db } from "@/db"
 import { users } from "@/db/schema"
-import { eq, like } from "drizzle-orm"
+import { eq } from "drizzle-orm"
 
 export const dynamic = "force-dynamic"
 
@@ -58,9 +58,9 @@ export async function POST(req: NextRequest) {
       if (email) {
         const clerkUserId = data.id as string
 
-        // Find user record by email pattern in temp clerk ID
+        // Find user record by exact email match
         const existingUser = await db.query.users.findFirst({
-          where: like(users.clerkUserId, `%${email}`)
+          where: eq(users.email, email.toLowerCase().trim())
         })
 
         if (existingUser) {

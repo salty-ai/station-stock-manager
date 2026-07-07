@@ -182,6 +182,7 @@ export async function createStationUser(input: z.infer<typeof createUserSchema>)
     const [newUser] = await db.insert(users).values({
       stationId: validatedInput.stationId,
       clerkUserId: tempClerkUserId,
+      email: validatedInput.email.toLowerCase().trim(),
       username: validatedInput.username,
       role: validatedInput.role,
       isActive: true,

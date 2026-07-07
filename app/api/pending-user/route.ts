@@ -1,19 +1,29 @@
 import { NextRequest, NextResponse } from "next/server"
+import { auth } from "@clerk/nextjs/server"
 import { db } from "@/db"
 import { users } from "@/db/schema"
-import { like } from "drizzle-orm"
+import { eq } from "drizzle-orm"
 
 export async function POST(request: NextRequest) {
   try {
+    // Require Clerk session — prevents unauthenticated enumeration
+    const { userId } = await auth()
+    if (!userId) {
+      return NextResponse.json(
+        { error: "Authentication required" },
+        { status: 401 }
+      )
+    }
+
     const { email } = await request.json()
 
-    if (!email) {
+    if (!email || typeof email !== "string") {
       return NextResponse.json({ error: "Email is required" }, { status: 400 })
     }
 
-    // Find the pending user record
+    // Find the pending user record by exact email match
     const pendingUser = await db.query.users.findFirst({
-      where: like(users.clerkUserId, `temp_%_${email}`)
+      where: eq(users.email, email.toLowerCase().trim())
     })
 
     if (!pendingUser) {
@@ -23,10 +33,10 @@ export async function POST(request: NextRequest) {
       )
     }
 
+    // Return only the minimum needed for pre-activation setup — no role/stationId leakage
     return NextResponse.json({
-      username: pendingUser.username,
-      role: pendingUser.role,
-      stationId: pendingUser.stationId
+      exists: true,
+      username: pendingUser.username
     })
   } catch (error) {
     console.error("Error fetching pending user:", error)

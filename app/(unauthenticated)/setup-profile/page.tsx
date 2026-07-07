@@ -4,7 +4,7 @@ import { SetupProfileForm } from "./_components/setup-profile-form"
 import { createClerkClient } from "@clerk/backend"
 import { db } from "@/db"
 import { users } from "@/db/schema"
-import { like, eq } from "drizzle-orm"
+import { eq } from "drizzle-orm"
 
 const clerkClient = createClerkClient({
   secretKey: process.env.CLERK_SECRET_KEY!
@@ -24,7 +24,7 @@ export default async function SetupProfilePage() {
   // Check if there's a pending invitation for this email
   if (userEmail) {
     const pendingUser = await db.query.users.findFirst({
-      where: like(users.clerkUserId, `temp_%_${userEmail}`)
+      where: eq(users.email, userEmail.toLowerCase().trim())
     })
 
     // If it's a staff invitation, complete setup automatically and redirect

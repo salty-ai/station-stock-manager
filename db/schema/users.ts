@@ -8,6 +8,7 @@ export const users = pgTable("users", {
     .references(() => stations.id)
     .notNull(),
   clerkUserId: text("clerk_user_id").unique().notNull(),
+  email: text("email").unique(),
   username: text("username").unique().notNull(),
   role: userRole("role").notNull(),
   isActive: boolean("is_active").default(true).notNull(),

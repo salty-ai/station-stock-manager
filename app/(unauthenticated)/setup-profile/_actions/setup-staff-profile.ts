@@ -4,7 +4,7 @@ import { auth } from "@clerk/nextjs/server"
 import { createClerkClient } from "@clerk/backend"
 import { db } from "@/db"
 import { users } from "@/db/schema"
-import { eq, like } from "drizzle-orm"
+import { eq } from "drizzle-orm"
 import { z } from "zod"
 
 const clerkClient = createClerkClient({
@@ -44,7 +44,7 @@ export async function setupStaffProfile(
 
     // Find the pending user record created during invitation
     const pendingUser = await db.query.users.findFirst({
-      where: like(users.clerkUserId, `temp_%_${userEmail}`)
+      where: eq(users.email, userEmail.toLowerCase().trim())
     })
 
     if (!pendingUser || pendingUser.role !== "staff") {

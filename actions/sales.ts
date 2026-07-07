@@ -89,7 +89,7 @@ export async function recordSale(input: z.infer<typeof recordSaleSchema>) {
     }
 
     const result = await db.transaction(async tx => {
-      // Validate all products exist and have sufficient stock
+      // Validate all products exist and belong to the station
       const productChecks = await Promise.all(
         validatedInput.items.map(async item => {
           const product = await tx.query.products.findFirst({
@@ -102,13 +102,6 @@ export async function recordSale(input: z.infer<typeof recordSaleSchema>) {
 
           if (!product) {
             throw new Error(`Product not found: ${item.productId}`)
-          }
-
-          const currentStock = parseFloat(product.currentStock)
-          if (currentStock < item.quantity) {
-            throw new Error(
-              `Insufficient stock for ${product.name}. Available: ${currentStock}, Requested: ${item.quantity}`
-            )
           }
 
           return { product, item }
@@ -154,24 +147,31 @@ export async function recordSale(input: z.infer<typeof recordSaleSchema>) {
           }
         })
 
-        // Update product stock
-        const currentStock = parseFloat(product.currentStock)
-        const newStock = currentStock - item.quantity
+        // Atomically decrement stock only if sufficient — prevents race conditions
+        // and avoids float-math rounding by doing the arithmetic in PostgreSQL.
+        const updatedRows = await tx.execute(
+          sql`UPDATE ${products} SET current_stock = current_stock::numeric - ${item.quantity}::numeric, updated_at = NOW() WHERE ${products.id} = ${item.productId} AND ${products.currentStock}::numeric >= ${item.quantity}::numeric RETURNING current_stock, (current_stock::numeric + ${item.quantity}::numeric) AS previous_stock`
+        )
 
-        await tx
-          .update(products)
-          .set({
-            currentStock: newStock.toString(),
-            updatedAt: new Date()
-          })
-          .where(eq(products.id, item.productId))
+        const updatedRow = updatedRows[0] as
+          | { current_stock: string; previous_stock: string }
+          | undefined
+
+        if (!updatedRow) {
+          throw new Error(
+            `Insufficient stock for ${product.name}. Requested: ${item.quantity}`
+          )
+        }
+
+        const previousStock = parseFloat(updatedRow.previous_stock)
+        const newStock = parseFloat(updatedRow.current_stock)
 
         // Record stock movement
         await tx.insert(stockMovements).values({
           productId: item.productId,
           movementType: "sale",
           quantity: (-item.quantity).toString(), // Negative for sale
-          previousStock: currentStock.toString(),
+          previousStock: previousStock.toString(),
           newStock: newStock.toString(),
           reference: transaction.id
         })
@@ -520,20 +520,25 @@ export async function voidTransaction(transactionId: string, reason: string) {
         throw new Error("Access denied for this transaction")
       }
 
-      // Restore stock for each item
+      // Restore stock for each item atomically
       for (const item of transaction.items) {
-        const currentStock = parseFloat(item.product.currentStock)
         const quantity = parseFloat(item.quantity)
-        const newStock = currentStock + quantity
 
-        // Update product stock
-        await tx
-          .update(products)
-          .set({
-            currentStock: newStock.toString(),
-            updatedAt: new Date()
-          })
-          .where(eq(products.id, item.productId))
+        // Atomic stock increment — arithmetic done in PostgreSQL
+        const updatedRows = await tx.execute(
+          sql`UPDATE ${products} SET current_stock = current_stock::numeric + ${quantity}::numeric, updated_at = NOW() WHERE ${products.id} = ${item.productId} RETURNING current_stock, (current_stock::numeric - ${quantity}::numeric) AS previous_stock`
+        )
+
+        const updatedRow = updatedRows[0] as
+          | { current_stock: string; previous_stock: string }
+          | undefined
+
+        if (!updatedRow) {
+          throw new Error(`Product not found: ${item.productId}`)
+        }
+
+        const currentStock = parseFloat(updatedRow.previous_stock)
+        const newStock = parseFloat(updatedRow.current_stock)
 
         // Record stock movement for void
         await tx.insert(stockMovements).values({

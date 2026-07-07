@@ -123,7 +123,7 @@ export async function recordStockAdjustment(
 
   return handleDatabaseOperation(async () => {
     const result = await db.transaction(async tx => {
-      // Get current product stock
+      // Get current product (for name validation / existence check)
       const product = await tx.query.products.findFirst({
         where: eq(products.id, validatedInput.productId)
       })
@@ -132,24 +132,27 @@ export async function recordStockAdjustment(
         throw new Error("Product not found")
       }
 
-      const currentStock = parseFloat(product.currentStock)
       const adjustment = validatedInput.quantity
-      const newStock = currentStock + adjustment
 
-      // Validate stock levels
-      if (newStock < 0) {
+      // Atomically update stock — arithmetic done in PostgreSQL, not JS float math.
+      // Guard against negative result for positive-direction safety:
+      const updatedRows = await tx.execute(
+        sql`UPDATE ${products} SET current_stock = current_stock::numeric + ${adjustment}::numeric, updated_at = NOW() WHERE ${products.id} = ${validatedInput.productId} AND (current_stock::numeric + ${adjustment}::numeric) >= 0 RETURNING current_stock, (current_stock::numeric - ${adjustment}::numeric) AS previous_stock`
+      )
+
+      const updatedRow = updatedRows[0] as
+        | { current_stock: string; previous_stock: string }
+        | undefined
+
+      if (!updatedRow) {
         throw new Error("Stock adjustment would result in negative stock")
       }
 
-      // Update product stock
-      const [updatedProduct] = await tx
-        .update(products)
-        .set({
-          currentStock: newStock.toString(),
-          updatedAt: new Date()
-        })
-        .where(eq(products.id, validatedInput.productId))
-        .returning()
+      const previousStock = parseFloat(updatedRow.previous_stock)
+      const newStock = parseFloat(updatedRow.current_stock)
+
+      // Build the updated product object from the pre-update fetch + new stock
+      const updatedProduct = { ...product, currentStock: updatedRow.current_stock, updatedAt: new Date() }
 
       // Record stock movement
       const [movement] = await tx
@@ -158,7 +161,7 @@ export async function recordStockAdjustment(
           productId: validatedInput.productId,
           movementType: "adjustment",
           quantity: adjustment.toString(),
-          previousStock: currentStock.toString(),
+          previousStock: previousStock.toString(),
           newStock: newStock.toString(),
           reference: `${validatedInput.reason}${validatedInput.reference ? ` - ${validatedInput.reference}` : ""}`
         })
@@ -167,7 +170,7 @@ export async function recordStockAdjustment(
       return {
         product: updatedProduct,
         movement,
-        previousStock: currentStock,
+        previousStock,
         newStock,
         adjustment
       }
@@ -217,7 +220,7 @@ export async function recordDelivery(
 
   return handleDatabaseOperation(async () => {
     const result = await db.transaction(async tx => {
-      // Get current product stock
+      // Get current product (for existence check)
       const product = await tx.query.products.findFirst({
         where: eq(products.id, validatedInput.productId)
       })
@@ -226,29 +229,28 @@ export async function recordDelivery(
         throw new Error("Product not found")
       }
 
-      const currentStock = parseFloat(product.currentStock)
       const deliveryQuantity = validatedInput.quantity
-      const newStock = currentStock + deliveryQuantity
 
-      // Update product stock and optionally unit price if unit cost provided
-      const updateData: {
-        currentStock: string
-        updatedAt: Date
-        unitPrice?: string
-      } = {
-        currentStock: newStock.toString(),
-        updatedAt: new Date()
+      // Atomically update stock — arithmetic done in PostgreSQL.
+      // Optionally update unit_price if a unit cost was provided.
+      const updatedRows = validatedInput.unitCost !== undefined
+        ? await tx.execute(
+            sql`UPDATE ${products} SET current_stock = current_stock::numeric + ${deliveryQuantity}::numeric, unit_price = ${validatedInput.unitCost}::numeric, updated_at = NOW() WHERE ${products.id} = ${validatedInput.productId} RETURNING *, (current_stock::numeric - ${deliveryQuantity}::numeric) AS previous_stock`
+          )
+        : await tx.execute(
+            sql`UPDATE ${products} SET current_stock = current_stock::numeric + ${deliveryQuantity}::numeric, updated_at = NOW() WHERE ${products.id} = ${validatedInput.productId} RETURNING *, (current_stock::numeric - ${deliveryQuantity}::numeric) AS previous_stock`
+          )
+
+      const updatedRow = updatedRows[0] as
+        | (typeof products.$inferSelect & { previous_stock: string })
+        | undefined
+
+      if (!updatedRow) {
+        throw new Error("Product not found")
       }
 
-      if (validatedInput.unitCost !== undefined) {
-        updateData.unitPrice = validatedInput.unitCost.toString()
-      }
-
-      const [updatedProduct] = await tx
-        .update(products)
-        .set(updateData)
-        .where(eq(products.id, validatedInput.productId))
-        .returning()
+      const previousStock = parseFloat(updatedRow.previous_stock)
+      const newStock = parseFloat(updatedRow.currentStock)
 
       // Build reference string - moved supplier query inside transaction
       let reference = "Delivery"
@@ -271,16 +273,19 @@ export async function recordDelivery(
           productId: validatedInput.productId,
           movementType: "delivery",
           quantity: deliveryQuantity.toString(),
-          previousStock: currentStock.toString(),
+          previousStock: previousStock.toString(),
           newStock: newStock.toString(),
           reference
         })
         .returning()
 
+      // Strip the extra previous_stock column before returning
+      const { previous_stock: _ps, ...productData } = updatedRow
+
       return {
-        product: updatedProduct,
+        product: productData,
         movement,
-        previousStock: currentStock,
+        previousStock,
         newStock,
         deliveryQuantity,
         priceUpdated: validatedInput.unitCost !== undefined
@@ -586,7 +591,7 @@ export async function bulkStockUpdate(
       const updateResults = []
 
       for (const update of validatedInput.updates) {
-        // Get current product stock
+        // Get current product (for existence check / name)
         const product = await tx.query.products.findFirst({
           where: eq(products.id, update.productId)
         })
@@ -595,31 +600,30 @@ export async function bulkStockUpdate(
           throw new Error(`Product not found: ${update.productId}`)
         }
 
-        const currentStock = parseFloat(product.currentStock)
-        const newStock = currentStock + update.quantity
+        // Atomically update stock — arithmetic done in PostgreSQL
+        const updatedRows = await tx.execute(
+          sql`UPDATE ${products} SET current_stock = current_stock::numeric + ${update.quantity}::numeric, updated_at = NOW() WHERE ${products.id} = ${update.productId} AND (current_stock::numeric + ${update.quantity}::numeric) >= 0 RETURNING current_stock, (current_stock::numeric - ${update.quantity}::numeric) AS previous_stock`
+        )
 
-        if (newStock < 0) {
+        const updatedRow = updatedRows[0] as
+          | { current_stock: string; previous_stock: string }
+          | undefined
+
+        if (!updatedRow) {
           throw new Error(
             `Invalid stock update for ${product.name}: would result in negative stock`
           )
         }
 
-        // Update product stock
-        const [updatedProduct] = await tx
-          .update(products)
-          .set({
-            currentStock: newStock.toString(),
-            updatedAt: new Date()
-          })
-          .where(eq(products.id, update.productId))
-          .returning()
+        const previousStock = parseFloat(updatedRow.previous_stock)
+        const newStock = parseFloat(updatedRow.current_stock)
 
         // Record stock movement
         await tx.insert(stockMovements).values({
           productId: update.productId,
           movementType: update.movementType,
           quantity: update.quantity.toString(),
-          previousStock: currentStock.toString(),
+          previousStock: previousStock.toString(),
           newStock: newStock.toString(),
           reference: update.reason
         })
@@ -627,7 +631,7 @@ export async function bulkStockUpdate(
         updateResults.push({
           productId: update.productId,
           productName: product.name,
-          previousStock: currentStock,
+          previousStock,
           newStock,
           quantity: update.quantity
         })
